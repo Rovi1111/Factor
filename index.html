@@ -46,7 +46,8 @@ textarea{width:100%;min-height:240px;font-family:var(--mono);font-size:12.5px;re
 button{font:inherit;cursor:pointer;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:6px;padding:6px 12px}
 button:hover{border-color:var(--accent)}
 button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:16px 0}
+.toggle{display:inline-flex;align-items:center;gap:6px;cursor:pointer;padding:6px 4px}
 .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}
 @media (max-width:820px){.kpis{grid-template-columns:1fr 1fr}}
 .kpi .k{font-size:12px;color:var(--muted)}
@@ -105,6 +106,7 @@ tr.sub td{color:var(--muted);background:var(--card)}
   <div class="toolbar">
     <button id="btnSwap">Поменять A ↔ B</button>
     <button id="btnClear">Очистить</button>
+    <label class="toggle" title="Сравнивать суммы в исходной валюте, курс не нужен"><input type="checkbox" id="noConv"> Только валюта, без пересчёта в рубли</label>
     <span style="flex:1"></span>
     <button class="primary" id="btnXlsx">Выгрузить в Excel</button>
   </div>
@@ -227,7 +229,9 @@ function fillCards(){
   for (const s of sides){
     for (const f of ['label', 'cur', 'rate', 'text']) el[s][f].value = state[s][f];
   }
+  document.getElementById('noConv').checked = !!state.noConv;
 }
+document.getElementById('noConv').addEventListener('change', e => { state.noConv = e.target.checked; schedule(); });
 sides.forEach(buildCard); fillCards();
 
 let timer = null;
@@ -245,16 +249,18 @@ function levenshtein(a, b){
 
 function compute(){
   const P = {}, warns = [];
+  const noConv = !!state.noConv;
   for (const s of sides){
     const st = state[s];
     const p = parseTable(st.text);
     const rate = st.cur === 'RUB' ? 1 : parseNum(st.rate);
     P[s] = { ...p, agg: aggregate(p.rows), rate, cur: st.cur, label: st.label.trim() || ('Месяц ' + s) };
-    if (st.cur !== 'RUB' && !(rate > 0) && p.rows.length) warns.push(`Не указан курс ${st.cur} для «${P[s].label}».`);
+    if (!noConv && st.cur !== 'RUB' && !(rate > 0) && p.rows.length) warns.push(`Не указан курс ${st.cur} для «${P[s].label}».`);
   }
   const A = P.A, B = P.B;
   const sameCur = A.cur === B.cur;
-  if (!sameCur) warns.push(`Валюты месяцев различаются (${A.cur} и ${B.cur}): разница в валюте и разложение «объём / курс» не имеют смысла — всё изменение конвертируемых позиций отнесено к объёму.`);
+  if (!sameCur && noConv) warns.push(`Валюты месяцев различаются (${A.cur} и ${B.cur}): без пересчёта в рубли их нельзя сравнить. Выключите «Только валюта».`);
+  else if (!sameCur) warns.push(`Валюты месяцев различаются (${A.cur} и ${B.cur}): разница в валюте и разложение «объём / курс» не имеют смысла — всё изменение конвертируемых позиций отнесено к объёму.`);
 
   const keys = new Set([...A.agg.keys(), ...B.agg.keys()]);
   const items = [];
@@ -262,16 +268,17 @@ function compute(){
     const a = A.agg.get(k), b = B.agg.get(k);
     const rub = exclusions.has(k);
     const av = a ? a.amount : null, bv = b ? b.amount : null;
-    const aR = av == null ? null : rub ? av : av * A.rate;
-    const bR = bv == null ? null : rub ? bv : bv * B.rate;
+    const aR = noConv || av == null ? null : rub ? av : av * A.rate;
+    const bR = noConv || bv == null ? null : rub ? bv : bv * B.rate;
     let status;
     if (av == null) status = 'new';
     else if (bv == null) status = 'gone';
     else status = Math.abs(bv - av) < 1e-6 ? 'same' : 'chg';
     const dCur = (rub || sameCur) ? (bv || 0) - (av || 0) : null;
-    const dR = (bR || 0) - (aR || 0);
-    items.push({ key: k, name: (b || a).name, rub, av, bv, aR, bR, dCur, dR,
-      pct: aR ? dR / Math.abs(aR) : null, status, cntA: a ? a.count : 0, cntB: b ? b.count : 0 });
+    // без пересчёта dR = изменение в валюте (для сортировки)
+    const dR = noConv ? (dCur || 0) : (bR || 0) - (aR || 0);
+    const pct = noConv ? (av && dCur != null ? dCur / Math.abs(av) : null) : (aR ? dR / Math.abs(aR) : null);
+    items.push({ key: k, name: (b || a).name, rub, av, bv, aR, bR, dCur, dR, pct, status, cntA: a ? a.count : 0, cntB: b ? b.count : 0 });
   }
 
   const T = { curA: 0, curB: 0, rubA: 0, rubB: 0, exA: 0, exB: 0 };
@@ -297,7 +304,7 @@ function compute(){
   for (const n of onlyB) for (const k of A.agg.keys()) if (k !== n.key && k.length > 5 && levenshtein(n.key, k) <= 2) pairs.push([A.agg.get(k).name, n.name, 'B']);
   for (const [x, y, s] of pairs) warns.push(`Похоже на опечатку: «${x}» и «${y}» — сейчас это разные позиции (${s === 'A' ? 'первая есть только в ' + A.label : 'вторая есть только в ' + B.label}). Исправьте название во вставке, если это одно и то же.`);
 
-  return { A, B, items, T, warns, sameCur };
+  return { A, B, items, T, warns, sameCur, noConv };
 }
 
 /* ---------- rendering ---------- */
@@ -323,7 +330,37 @@ function factorRow(name, sub, v, max, color, cls){
     <div class="val ${sign(v)}">${s2(v)} ₽</div></div>`;
 }
 
+function buildCommentCur(R){
+  const { A, B, T, items, sameCur } = R;
+  const sa = CUR_SYM[A.cur], sb = CUR_SYM[B.cur];
+  const d = T.curB - T.curA, pct = T.curA ? d / T.curA : null;
+  const L = [];
+  let head = `Расходы на серверы за ${B.label} — ${f2(T.curB)} ${sb} против ${f2(T.curA)} ${sa} за ${A.label}`;
+  if (!sameCur) head += '.';
+  else head += Math.abs(d) >= 0.005 ? `: ${d > 0 ? 'выросли' : 'снизились'} на ${f2(Math.abs(d))} ${sa} (${sPct(pct)}).` : ': не изменились.';
+  L.push(head);
+  const rubNames = items.filter(i => i.rub).map(i => i.name);
+  if (rubNames.length) L.push(`Позиции в рублях (${rubNames.join(', ')}): ${f2(T.exA)} → ${f2(T.exB)} ₽ (${s2(T.fRub)} ₽).`);
+  const moved = items.filter(i => i.status !== 'same' && !i.rub).sort((x, y) => Math.abs(y.dR) - Math.abs(x.dR)).slice(0, 5);
+  if (moved.length){
+    L.push('Основные изменения по позициям:');
+    for (const i of moved){
+      const cur = i.rub ? '₽' : sa;
+      let t;
+      if (i.status === 'new') t = `новая, ${f2(i.bv)} ${cur}`;
+      else if (i.status === 'gone') t = `пропала (было ${f2(i.av)} ${cur})`;
+      else t = `${f2(i.av)} → ${f2(i.bv)} ${cur}` + (i.dCur != null ? ` (${s2(i.dCur)} ${cur})` : '');
+      L.push(`• ${i.name}: ${t};`);
+    }
+    L[L.length - 1] = L[L.length - 1].replace(/;$/, '.');
+  }
+  const nNew = items.filter(i => i.status === 'new').length, nGone = items.filter(i => i.status === 'gone').length;
+  if (nNew || nGone) L.push(`Новых позиций: ${nNew}, пропавших: ${nGone}.`);
+  return L.join('\n');
+}
+
 function buildComment(R){
+  if (R.noConv) return buildCommentCur(R);
   const { A, B, T, items, sameCur } = R;
   const sa = CUR_SYM[A.cur], sb = CUR_SYM[B.cur];
   const pct = T.rubA ? T.dRub / T.rubA : null;
@@ -370,7 +407,7 @@ function render(){
 
   for (const s of sides){
     const p = R[s];
-    el[s].rate.disabled = state[s].cur === 'RUB';
+    el[s].rate.disabled = state[s].cur === 'RUB' || R.noConv;
     let t = `Строк: ${p.rows.length}, уникальных позиций: ${p.agg.size}`;
     if (p.bad.length) t += ` · <span class="bad" title="${esc(p.bad.map(b => b.line + ': ' + b.text).join('\n'))}">не распознано: ${p.bad.length} (стр. ${p.bad.slice(0, 5).map(b => b.line).join(', ')}${p.bad.length > 5 ? '…' : ''})</span>`;
     el[s].info.innerHTML = t;
@@ -384,7 +421,19 @@ function render(){
   const max = Math.max(Math.abs(T.fVol), Math.abs(T.fRate), Math.abs(T.fRub), Math.abs(T.dRub));
   const pct = T.rubA ? T.dRub / T.rubA : null;
 
-  let html = `<div class="kpis">
+  const warnHtml = warns.length ? '<div class="warns">' + warns.map(w => `<div class="warn">${esc(w)}</div>`).join('') + '</div>' : '';
+  let html;
+  if (R.noConv){
+    const d = T.curB - T.curA, hasRub = items.some(i => i.rub);
+    const rubLine = v => hasRub ? `<div class="s">+ ${f2(v)} ₽ в рублях (отдельно)</div>` : '';
+    html = `<div class="kpis">
+    <div class="card kpi"><div class="k">Итог ${esc(A.label)}</div><div class="v">${f2(T.curA)} ${sa}</div>${rubLine(T.exA)}</div>
+    <div class="card kpi"><div class="k">Итог ${esc(B.label)}</div><div class="v">${f2(T.curB)} ${sb}</div>${rubLine(T.exB)}</div>
+    <div class="card kpi"><div class="k">Изменение</div><div class="v ${sameCur ? sign(d) : ''}">${sameCur ? s2(d) + ' ' + sa : '—'}</div><div class="s">${sameCur ? sPct(T.curA ? d / T.curA : null) : 'валюты различаются'}</div></div>
+    <div class="card kpi"><div class="k">Позиции в рублях</div><div class="v ${sign(T.fRub)}">${hasRub ? s2(T.fRub) + ' ₽' : '—'}</div><div class="s">${hasRub ? f2(T.exA) + ' → ' + f2(T.exB) + ' ₽' : 'нет'}</div></div>
+  </div>${warnHtml ? '<div class="card">' + warnHtml + '</div>' : ''}`;
+  } else {
+  html = `<div class="kpis">
     <div class="card kpi"><div class="k">Итог ${esc(A.label)}</div><div class="v">${f2(T.rubA)} ₽</div><div class="s">${f2(T.curA)} ${sa} + ${f2(T.exA)} ₽ в рублях</div></div>
     <div class="card kpi"><div class="k">Итог ${esc(B.label)}</div><div class="v">${f2(T.rubB)} ₽</div><div class="s">${f2(T.curB)} ${sb} + ${f2(T.exB)} ₽ в рублях</div></div>
     <div class="card kpi"><div class="k">Изменение, ₽</div><div class="v ${sign(T.dRub)}">${s2(T.dRub)} ₽</div><div class="s">${sPct(pct)}</div></div>
@@ -399,7 +448,8 @@ function render(){
   }
   html += factorRow('Рублёвые позиции', `${f2(T.exA)} → ${f2(T.exB)} ₽`, T.fRub, max, 'var(--f-rub)');
   html += factorRow('<b>Итого</b>', '', T.dRub, max, 'var(--muted)', 'total');
-  html += `</div>${warns.length ? '<div class="warns">' + warns.map(w => `<div class="warn">${esc(w)}</div>`).join('') + '</div>' : ''}</div>`;
+  html += `</div>${warnHtml}</div>`;
+  }
 
   html += `<div class="card section"><div class="row" style="justify-content:space-between;align-items:center"><h2 style="margin:0">Комментарий</h2><button id="btnCopy">Скопировать</button></div>
     <textarea id="comment" spellcheck="false">${esc(buildComment(R))}</textarea></div>`;
@@ -421,7 +471,7 @@ function render(){
   const cols = [
     ['rub', '₽', 'l'], ['name', 'Позиция', 'l'], ['status', 'Статус', 'l'],
     ['av', `${esc(A.label)} (${A.cur})`], ['bv', `${esc(B.label)} (${B.cur})`], ['dCur', 'Δ'],
-    ['aR', `${esc(A.label)}, ₽`], ['bR', `${esc(B.label)}, ₽`], ['dR', 'Δ ₽'], ['pct', 'Δ % (₽)']
+    ...(R.noConv ? [['pct', 'Δ %']] : [['aR', `${esc(A.label)}, ₽`], ['bR', `${esc(B.label)}, ₽`], ['dR', 'Δ ₽'], ['pct', 'Δ % (₽)']])
   ];
   html += `<div class="tablewrap"><table><thead><tr>${cols.map(([k, t, c]) =>
     `<th class="${c || ''}" data-sort="${k}" ${k === 'rub' ? 'title="Позиция уже в рублях — не конвертировать"' : ''}>${t}${sortCol === k ? (sortDir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr></thead><tbody>`;
@@ -435,10 +485,17 @@ function render(){
       <td>${i.av == null ? '—' : f2(i.av) + tag}${cnt(i.cntA)}</td>
       <td>${i.bv == null ? '—' : f2(i.bv) + tag}${cnt(i.cntB)}</td>
       <td class="${sign(i.dCur || 0)}">${i.dCur == null ? '—' : s2(i.dCur) + tag}</td>
-      <td>${f2(i.aR)}</td><td>${f2(i.bR)}</td>
-      <td class="${sign(i.dR)}">${s2(i.dR)}</td>
+      ${R.noConv ? '' : `<td>${f2(i.aR)}</td><td>${f2(i.bR)}</td>
+      <td class="${sign(i.dR)}">${s2(i.dR)}</td>`}
       <td class="${sign(i.dR)}">${sPct(i.pct)}</td></tr>`;
   }
+  if (R.noConv){
+    const d = T.curB - T.curA;
+    html += `<tr class="tot"><td></td><td class="l">Итого в валюте</td><td></td><td>${f2(T.curA)} ${sa}</td><td>${f2(T.curB)} ${sb}</td>
+      <td class="${sameCur ? sign(d) : ''}">${sameCur ? s2(d) + ' ' + sa : '—'}</td><td class="${sameCur ? sign(d) : ''}">${sameCur ? sPct(T.curA ? d / T.curA : null) : '—'}</td></tr>`;
+    if (items.some(i => i.rub)) html += `<tr class="sub"><td></td><td class="l">Позиции в рублях</td><td></td><td>${f2(T.exA)} ₽</td><td>${f2(T.exB)} ₽</td>
+      <td>${s2(T.fRub)} ₽</td><td>${sPct(T.exA ? T.fRub / T.exA : null)}</td></tr>`;
+  } else
   html += `<tr class="tot"><td></td><td class="l">Итого</td><td></td><td></td><td></td><td></td>
       <td>${f2(T.rubA)}</td><td>${f2(T.rubB)}</td><td class="${sign(T.dRub)}">${s2(T.dRub)}</td><td class="${sign(T.dRub)}">${sPct(pct)}</td></tr>
     <tr class="sub"><td></td><td class="l">в т. ч. в валюте</td><td></td><td>${f2(T.curA)} ${sa}</td><td>${f2(T.curB)} ${sb}</td><td>${sameCur ? s2(T.curB - T.curA) + ' ' + sa : '—'}</td>
@@ -543,17 +600,31 @@ function exportXlsx(){
   const { A, B, T, items, sameCur } = R;
   const H = s => ({ v: s, s: 1 });
   const sorted = items.slice().sort((x, y) => Math.abs(y.dR) - Math.abs(x.dR));
-  const r1 = [[H('Позиция'), H('Статус'), H('В рублях'), H(`${A.label} (${A.cur})`), H(`${B.label} (${B.cur})`), H('Δ'), H(`${A.label}, ₽`), H(`${B.label}, ₽`), H('Δ ₽'), H('Δ % (₽)')]];
+  const b = v => v == null ? null : { v, s: 4 };
+  const pctCell = (v, st) => v == null || !isFinite(v) ? null : { v, s: st || 3 };
+  let r1, r2, w1;
+  if (R.noConv){
+    const d = sameCur ? T.curB - T.curA : null;
+    r1 = [[H('Позиция'), H('Статус'), H('В рублях'), H(`${A.label} (${A.cur})`), H(`${B.label} (${B.cur})`), H('Δ'), H('Δ %')]];
+    for (const i of sorted) r1.push([i.name, STATUS[i.status][0], i.rub ? 'да' : '', i.av, i.bv, i.dCur, pctCell(i.pct)]);
+    r1.push([]);
+    r1.push([H('Итого в валюте'), '', '', b(T.curA), b(T.curB), b(d), pctCell(d != null && T.curA ? d / T.curA : null, 5)]);
+    if (items.some(i => i.rub)) r1.push(['Позиции в рублях', '', '', T.exA, T.exB, T.fRub, pctCell(T.exA ? T.fRub / T.exA : null)]);
+    r2 = [[H('Показатель'), H('Значение')], ['Режим', 'без пересчёта в рубли'],
+      [`Итог ${A.label}, ${A.cur}`, T.curA], [`Итог ${B.label}, ${B.cur}`, T.curB], [H(`Изменение, ${A.cur}`), b(d)],
+      ['Позиции в рублях, ' + A.label, T.exA], ['Позиции в рублях, ' + B.label, T.exB], [], [H('Комментарий'), null]];
+    w1 = [46, 16, 10, 16, 16, 12, 11];
+  } else {
+  r1 = [[H('Позиция'), H('Статус'), H('В рублях'), H(`${A.label} (${A.cur})`), H(`${B.label} (${B.cur})`), H('Δ'), H(`${A.label}, ₽`), H(`${B.label}, ₽`), H('Δ ₽'), H('Δ % (₽)')]];
   for (const i of sorted){
     r1.push([i.name, STATUS[i.status][0], i.rub ? 'да' : '', i.av, i.bv, i.dCur, i.aR, i.bR, i.dR, i.pct == null ? null : { v: i.pct, s: 3 }]);
   }
-  const b = v => v == null ? null : { v, s: 4 };
   r1.push([]);
   r1.push([H('Итого'), '', '', null, null, null, b(T.rubA), b(T.rubB), b(T.dRub), T.rubA ? { v: T.dRub / T.rubA, s: 5 } : null]);
   r1.push(['в т. ч. в валюте', '', '', T.curA, T.curB, sameCur ? T.curB - T.curA : null, T.convA, T.convB, T.convB - T.convA, T.convA ? { v: (T.convB - T.convA) / T.convA, s: 3 } : null]);
   r1.push(['в т. ч. в рублях', '', '', T.exA, T.exB, T.fRub, T.exA, T.exB, T.fRub, T.exA ? { v: T.fRub / T.exA, s: 3 } : null]);
 
-  const r2 = [[H('Показатель'), H('Значение')],
+  r2 = [[H('Показатель'), H('Значение')],
     [`Валюта ${A.label}`, A.cur], [`Курс ${A.label}`, { v: A.rate, s: 6 }],
     [`Валюта ${B.label}`, B.cur], [`Курс ${B.label}`, { v: B.rate, s: 6 }], [],
     [`Итог ${A.label}, ${A.cur}`, T.curA], [`Итог ${B.label}, ${B.cur}`, T.curB],
@@ -562,6 +633,8 @@ function exportXlsx(){
     ...(sameCur ? [['Курс', T.fRate], ['Объём', T.fVol]] : [['Конвертируемые позиции', T.fVol]]),
     ['Рублёвые позиции', T.fRub], [H('Итого'), b(T.fRate + T.fVol + T.fRub)], [],
     [H('Комментарий'), null]];
+  w1 = [46, 16, 10, 16, 16, 12, 16, 16, 14, 11];
+  }
   document.getElementById('comment').value.split('\n').forEach(l => r2.push([l]));
 
   const styles = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
@@ -584,7 +657,7 @@ function exportXlsx(){
     ['xl/workbook.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Сравнение" sheetId="1" r:id="rId1"/><sheet name="Итоги" sheetId="2" r:id="rId2"/></sheets></workbook>'],
     ['xl/_rels/workbook.xml.rels', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>'],
     ['xl/styles.xml', styles],
-    ['xl/worksheets/sheet1.xml', sheetXml(r1, [46, 16, 10, 16, 16, 12, 16, 16, 14, 11])],
+    ['xl/worksheets/sheet1.xml', sheetXml(r1, w1)],
     ['xl/worksheets/sheet2.xml', sheetXml(r2, [34, 22])]
   ];
   const blob = zip(files);
