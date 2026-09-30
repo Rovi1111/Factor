@@ -91,6 +91,15 @@ tr.sub td{color:var(--muted);background:var(--card)}
 #comment{min-height:150px;white-space:pre-wrap;font-family:inherit;font-size:13.5px}
 .section{margin-top:20px}
 .hint{font-size:12px;color:var(--muted)}
+tr.susp td{background:var(--warn-soft)}
+.wmark{color:var(--warn);margin-right:4px;cursor:help}
+.susp-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.susp-list li{display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:baseline;font-size:13px}
+@media (max-width:620px){.susp-list li{grid-template-columns:1fr;gap:2px}}
+.stype{display:inline-block;font-size:11px;font-weight:600;padding:1px 7px;border-radius:10px;background:var(--warn-soft);color:var(--warn);text-align:center}
+.linkbtn{border:none;background:none;color:var(--accent);padding:0;font-size:12px;text-decoration:underline}
+input.jump{width:56px}
+.ok{color:var(--down)}
 </style>
 </head>
 <body>
@@ -170,7 +179,7 @@ function parseTable(text){
     }
     const v = parseNum(numStr);
     if (!name || !isFinite(v)) { bad.push({ line: i + 1, text: line.trim() }); return; }
-    rows.push({ name: normName(name), amount: v });
+    rows.push({ name: normName(name), amount: v, line: i + 1 });
   });
   return { rows, bad };
 }
@@ -302,9 +311,44 @@ function compute(){
   const pairs = [];
   for (const g of onlyA) for (const k of B.agg.keys()) if (k !== g.key && k.length > 5 && levenshtein(g.key, k) <= 2) pairs.push([g.name, B.agg.get(k).name, 'A']);
   for (const n of onlyB) for (const k of A.agg.keys()) if (k !== n.key && k.length > 5 && levenshtein(n.key, k) <= 2) pairs.push([A.agg.get(k).name, n.name, 'B']);
-  for (const [x, y, s] of pairs) warns.push(`Похоже на опечатку: «${x}» и «${y}» — сейчас это разные позиции (${s === 'A' ? 'первая есть только в ' + A.label : 'вторая есть только в ' + B.label}). Исправьте название во вставке, если это одно и то же.`);
+  // подозрительные значения
+  const susp = [];
+  const flag = (type, key, name, text) => susp.push({ type, key, name, text });
+  for (const s of sides){
+    const p = P[s];
+    for (const b of p.bad) flag('bad', null, null, `${p.label}, стр. ${b.line}: не распознана — «${b.text}»`);
+    for (const r of p.rows) if (r.amount < 0) flag('neg', normKey(r.name), r.name, `${p.label}, стр. ${r.line}: отрицательная сумма ${s2(r.amount)}`);
+    const seen = new Map();
+    for (const r of p.rows){
+      if (r.amount === 0) continue;
+      const k = normKey(r.name) + '|' + r.amount;
+      if (!seen.has(k)) seen.set(k, []);
+      seen.get(k).push(r);
+    }
+    for (const list of seen.values()) if (list.length > 1)
+      flag('dup', normKey(list[0].name), list[0].name, `${p.label}: строка «${list[0].name} — ${f2(list[0].amount)}» встречается ${list.length} раза (стр. ${list.map(r => r.line).join(', ')}) — возможно, вставлена дважды`);
+  }
+  for (const [x, y, s] of pairs){
+    const key = normKey(s === 'A' ? x : y);
+    flag('typo', key, s === 'A' ? x : y, `«${x}» и «${y}» — похоже на одну позицию с опечаткой (${s === 'A' ? 'первая есть только в ' + A.label : 'вторая есть только в ' + B.label})`);
+  }
+  const J = Math.max(1.01, parseNum(state.jump) || 3);
+  for (const it of items){
+    const cur = it.rub ? '₽' : CUR_SYM[A.cur];
+    if (it.status === 'chg' && it.av > 0 && it.bv > 0 && Math.max(it.av, it.bv) >= 1 && (it.rub || sameCur)){
+      const r = it.bv / it.av;
+      if (r >= J) flag('jump', it.key, it.name, `рост в ${nf1.format(r)} раза: ${f2(it.av)} → ${f2(it.bv)} ${cur}`);
+      else if (r <= 1 / J) flag('jump', it.key, it.name, `снижение в ${nf1.format(1 / r)} раза: ${f2(it.av)} → ${f2(it.bv)} ${cur}`);
+    }
+    if (it.av === 0) flag('zero', it.key, it.name, `${A.label}: позиция есть, но сумма 0` + (it.bv ? ` (в ${B.label} — ${f2(it.bv)} ${cur})` : ''));
+    if (it.bv === 0) flag('zero', it.key, it.name, `${B.label}: позиция есть, но сумма 0 — сервер выключен, но не удалён?`);
+  }
+  const ORDER = ['bad', 'neg', 'dup', 'typo', 'jump', 'zero'];
+  susp.sort((x, y) => ORDER.indexOf(x.type) - ORDER.indexOf(y.type));
+  const flags = new Map();
+  for (const f of susp) if (f.key){ if (!flags.has(f.key)) flags.set(f.key, []); flags.get(f.key).push(f.text); }
 
-  return { A, B, items, T, warns, sameCur, noConv };
+  return { A, B, items, T, warns, sameCur, noConv, susp, flags, J };
 }
 
 /* ---------- rendering ---------- */
@@ -478,9 +522,10 @@ function render(){
   const cnt = n => n > 1 ? ` <span class="muted" title="Строк во вставке">×${n}</span>` : '';
   for (const i of rows){
     const tag = i.rub ? '<span class="rubtag">₽</span>' : '';
-    html += `<tr>
+    const fl = R.flags.get(i.key);
+    html += `<tr${fl ? ' class="susp"' : ''}>
       <td class="l"><input type="checkbox" data-excl="${esc(i.key)}" ${i.rub ? 'checked' : ''} title="Не конвертировать (уже в рублях)"></td>
-      <td class="l name" title="${esc(i.name)}">${esc(i.name)}</td>
+      <td class="l name" title="${esc(i.name)}">${fl ? `<span class="wmark" title="${esc(fl.join('\n'))}">⚠</span>` : ''}${esc(i.name)}</td>
       <td class="l"><span class="badge ${STATUS[i.status][1]}">${STATUS[i.status][0]}</span></td>
       <td>${i.av == null ? '—' : f2(i.av) + tag}${cnt(i.cntA)}</td>
       <td>${i.bv == null ? '—' : f2(i.bv) + tag}${cnt(i.cntB)}</td>
@@ -504,6 +549,16 @@ function render(){
       <td>${f2(T.exA)}</td><td>${f2(T.exB)}</td><td>${s2(T.fRub)}</td><td>${sPct(T.exA ? T.fRub / T.exA : null)}</td></tr>`;
   html += `</tbody></table></div></div>`;
 
+  const TYPES = { bad: 'не распознано', neg: 'отрицательная', dup: 'дубль строки', typo: 'опечатка?', jump: 'резкий скачок', zero: 'нулевая сумма' };
+  html += `<div class="card section" id="suspCard"><div class="row" style="justify-content:space-between;align-items:center">
+    <h2 style="margin:0">Подозрительные значения${R.susp.length ? ' (' + R.susp.length + ')' : ''}</h2>
+    <label class="hint">Скачок, если сумма изменилась в <input type="text" class="jump" id="jumpX" inputmode="decimal" value="${esc(state.jump || '3')}"> раза и больше</label></div>`;
+  if (!R.susp.length) html += '<div class="ok">Ничего подозрительного не найдено.</div>';
+  else html += '<ul class="susp-list">' + R.susp.map(f => `<li><span class="stype">${TYPES[f.type]}</span>
+      <div>${f.name ? `<b>${esc(f.name)}</b> — ` : ''}${esc(f.text)}
+      ${f.key ? ` <button class="linkbtn" data-show="${esc(f.name)}">показать</button>` : ''}</div></li>`).join('') + '</ul>';
+  html += '</div>';
+
   const focusSearch = document.activeElement && document.activeElement.id === 'search';
   res.innerHTML = html;
   if (focusSearch){ const s = document.getElementById('search'); s.focus(); s.setSelectionRange(s.value.length, s.value.length); }
@@ -526,12 +581,17 @@ document.getElementById('results').addEventListener('click', e => {
   }
   const fl = t.getAttribute && t.getAttribute('data-filter');
   if (fl){ filter = fl; render(); return; }
+  const sh = t.getAttribute && t.getAttribute('data-show');
+  if (sh != null){ filter = 'all'; search = sh.toLowerCase(); render(); document.querySelector('.filters').scrollIntoView({ behavior: 'smooth', block: 'start' }); return; }
   if (t.id === 'btnCopy'){
     const ta = document.getElementById('comment');
     const done = () => { t.textContent = 'Скопировано'; setTimeout(() => { t.textContent = 'Скопировать'; }, 1500); };
     if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(ta.value).then(done, () => { ta.select(); document.execCommand('copy'); done(); });
     else { ta.select(); document.execCommand('copy'); done(); }
   }
+});
+document.getElementById('results').addEventListener('change', e => {
+  if (e.target.id === 'jumpX'){ state.jump = e.target.value.trim(); lsSet(LS_STATE, state); render(); }
 });
 document.getElementById('results').addEventListener('input', e => {
   if (e.target.id === 'search'){ search = e.target.value.trim(); render(); }
@@ -601,23 +661,24 @@ function exportXlsx(){
   const H = s => ({ v: s, s: 1 });
   const sorted = items.slice().sort((x, y) => Math.abs(y.dR) - Math.abs(x.dR));
   const b = v => v == null ? null : { v, s: 4 };
+  const chk = i => (R.flags.get(i.key) || []).join('; ');
   const pctCell = (v, st) => v == null || !isFinite(v) ? null : { v, s: st || 3 };
   let r1, r2, w1;
   if (R.noConv){
     const d = sameCur ? T.curB - T.curA : null;
-    r1 = [[H('Позиция'), H('Статус'), H('В рублях'), H(`${A.label} (${A.cur})`), H(`${B.label} (${B.cur})`), H('Δ'), H('Δ %')]];
-    for (const i of sorted) r1.push([i.name, STATUS[i.status][0], i.rub ? 'да' : '', i.av, i.bv, i.dCur, pctCell(i.pct)]);
+    r1 = [[H('Позиция'), H('Статус'), H('В рублях'), H(`${A.label} (${A.cur})`), H(`${B.label} (${B.cur})`), H('Δ'), H('Δ %'), H('Проверить')]];
+    for (const i of sorted) r1.push([i.name, STATUS[i.status][0], i.rub ? 'да' : '', i.av, i.bv, i.dCur, pctCell(i.pct), chk(i)]);
     r1.push([]);
     r1.push([H('Итого в валюте'), '', '', b(T.curA), b(T.curB), b(d), pctCell(d != null && T.curA ? d / T.curA : null, 5)]);
     if (items.some(i => i.rub)) r1.push(['Позиции в рублях', '', '', T.exA, T.exB, T.fRub, pctCell(T.exA ? T.fRub / T.exA : null)]);
     r2 = [[H('Показатель'), H('Значение')], ['Режим', 'без пересчёта в рубли'],
       [`Итог ${A.label}, ${A.cur}`, T.curA], [`Итог ${B.label}, ${B.cur}`, T.curB], [H(`Изменение, ${A.cur}`), b(d)],
       ['Позиции в рублях, ' + A.label, T.exA], ['Позиции в рублях, ' + B.label, T.exB], [], [H('Комментарий'), null]];
-    w1 = [46, 16, 10, 16, 16, 12, 11];
+    w1 = [46, 16, 10, 16, 16, 12, 11, 70];
   } else {
-  r1 = [[H('Позиция'), H('Статус'), H('В рублях'), H(`${A.label} (${A.cur})`), H(`${B.label} (${B.cur})`), H('Δ'), H(`${A.label}, ₽`), H(`${B.label}, ₽`), H('Δ ₽'), H('Δ % (₽)')]];
+  r1 = [[H('Позиция'), H('Статус'), H('В рублях'), H(`${A.label} (${A.cur})`), H(`${B.label} (${B.cur})`), H('Δ'), H(`${A.label}, ₽`), H(`${B.label}, ₽`), H('Δ ₽'), H('Δ % (₽)'), H('Проверить')]];
   for (const i of sorted){
-    r1.push([i.name, STATUS[i.status][0], i.rub ? 'да' : '', i.av, i.bv, i.dCur, i.aR, i.bR, i.dR, i.pct == null ? null : { v: i.pct, s: 3 }]);
+    r1.push([i.name, STATUS[i.status][0], i.rub ? 'да' : '', i.av, i.bv, i.dCur, i.aR, i.bR, i.dR, i.pct == null ? null : { v: i.pct, s: 3 }, chk(i)]);
   }
   r1.push([]);
   r1.push([H('Итого'), '', '', null, null, null, b(T.rubA), b(T.rubB), b(T.dRub), T.rubA ? { v: T.dRub / T.rubA, s: 5 } : null]);
@@ -633,9 +694,10 @@ function exportXlsx(){
     ...(sameCur ? [['Курс', T.fRate], ['Объём', T.fVol]] : [['Конвертируемые позиции', T.fVol]]),
     ['Рублёвые позиции', T.fRub], [H('Итого'), b(T.fRate + T.fVol + T.fRub)], [],
     [H('Комментарий'), null]];
-  w1 = [46, 16, 10, 16, 16, 12, 16, 16, 14, 11];
+  w1 = [46, 16, 10, 16, 16, 12, 16, 16, 14, 11, 70];
   }
   document.getElementById('comment').value.split('\n').forEach(l => r2.push([l]));
+  if (R.susp.length){ r2.push([], [H('Подозрительные значения'), null]); R.susp.forEach(f => r2.push([(f.name ? f.name + ': ' : '') + f.text])); }
 
   const styles = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
     '<numFmts count="1"><numFmt numFmtId="164" formatCode="0.0000000000000"/></numFmts>' +
